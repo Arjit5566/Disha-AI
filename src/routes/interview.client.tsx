@@ -2,10 +2,12 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Mic, MicOff, Target, ArrowRight, Loader2, CheckCircle2,
-  AlertTriangle, RotateCcw, Sparkles, Clock, ChevronRight,
+  Mic, Target, ArrowRight, Loader2, CheckCircle2,
+  AlertTriangle, RotateCcw, Sparkles, Clock,
   Award, TrendingUp, MessageSquare, Lightbulb, Play, Square,
-  Camera, Check, ShieldCheck, HelpCircle, Volume2, Maximize, Minimize, AlertCircle
+  Camera, ShieldCheck, HelpCircle, AlertCircle,
+  ShieldAlert, Ban, Eye, EyeOff, ScanFace, Smartphone, Users,
+  Maximize2
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell } from "@/components/AppShell";
@@ -16,9 +18,24 @@ import {
   saveInterviewResult
 } from "@/lib/interview.functions";
 import type { InterviewHistoryItem, FullInterviewEvaluation } from "@/lib/interview.functions";
+import {
+  loadProctoringModels,
+  getObjectDetectionModel,
+  analyzeVideoFrame,
+  type DetectedObject,
+  type ProctoringAnalysis
+} from "@/lib/proctoring";
 
-type Screen = "setup" | "permissions" | "interview" | "evaluating" | "results";
+type Screen = "setup" | "permissions" | "interview" | "evaluating" | "results" | "cancelled";
 type AIStatus = "idle" | "speaking" | "listening" | "thinking";
+
+interface ProctoringViolation {
+  id: string;
+  type: "phone" | "looking_away" | "multiple_persons" | "tab_switch" | "window_blur" | "clipboard_paste";
+  timestamp: string;
+  message: string;
+  severity: "warning" | "fatal";
+}
 
 const CATEGORY_STYLES: Record<string, { gradient: string; text: string }> = {
   Technical: { gradient: "from-blue-500/20 to-cyan-500/20 border-blue-500/30", text: "text-blue-400" },
@@ -28,6 +45,49 @@ const CATEGORY_STYLES: Record<string, { gradient: string; text: string }> = {
 };
 
 const TOTAL_QUESTIONS = 5;
+
+// Audio synth alerts using Web Audio API
+function playWarningBeep() {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const ctx = new AudioContextClass();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+    osc.frequency.setValueAtTime(880, ctx.currentTime + 0.12); // A5
+    gain.gain.setValueAtTime(0.28, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.4);
+  } catch (e) {
+    console.warn("Audio alert unavailable:", e);
+  }
+}
+
+function playTerminationBuzzer() {
+  try {
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const ctx = new AudioContextClass();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(340, ctx.currentTime);
+    osc.frequency.linearRampToValueAtTime(100, ctx.currentTime + 0.65);
+    gain.gain.setValueAtTime(0.35, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.7);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.7);
+  } catch (e) {
+    console.warn("Audio buzzer unavailable:", e);
+  }
+}
 
 export default function InterviewClient() {
   const genFirstQuestionFn = useServerFn(generateFirstQuestion);
@@ -39,9 +99,10 @@ export default function InterviewClient() {
   const [screen, setScreen] = useState<Screen>("setup");
   const [targetRole, setTargetRole] = useState("");
   
-  // Permissions
+  // Permissions & Streams
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [permissionsState, setPermissionsState] = useState<"idle" | "requesting" | "granted" | "denied">("idle");
+  const [aiModelLoaded, setAiModelLoaded] = useState(false);
   
   // Interview state
   const [history, setHistory] = useState<InterviewHistoryItem[]>([]);
@@ -61,23 +122,83 @@ export default function InterviewClient() {
   const [evaluation, setEvaluation] = useState<FullInterviewEvaluation | null>(null);
   const [isSavingResult, setIsSavingResult] = useState(false);
 
+  // Proctoring States
+  const [violations, setViolations] = useState<ProctoringViolation[]>([]);
+  const [warningModalOpen, setWarningModalOpen] = useState(false);
+  const [activeWarning, setActiveWarning] = useState<ProctoringViolation | null>(null);
+  const [proctorAnalysis, setProctorAnalysis] = useState<ProctoringAnalysis>({
+    faceStatus: "initializing",
+    lookingDirection: "center",
+    phoneDetected: false,
+    multiplePersonsDetected: false,
+    detectedObjects: [],
+    threatLevel: "normal",
+    summary: "Initializing proctoring...",
+  });
+
   // Refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const recognitionRef = useRef<any>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const elapsedRef = useRef(0);
+  const violationsRef = useRef<ProctoringViolation[]>([]);
+  const screenRef = useRef<Screen>("setup");
+  const lastViolationTimeRef = useRef<number>(0);
+  const consecutivePhoneRef = useRef<number>(0);
+  const consecutiveMultiPersonRef = useRef<number>(0);
+  const consecutiveAwayRef = useRef<number>(0);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const objectModelRef = useRef<any>(null);
+
   const speechSupported = typeof window !== "undefined" && (!!(window as any).SpeechRecognition || !!(window as any).webkitSpeechRecognition);
 
-  // Pre-load voices
+  // Sync refs
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
+
+  useEffect(() => {
+    elapsedRef.current = elapsed;
+  }, [elapsed]);
+
+  useEffect(() => {
+    violationsRef.current = violations;
+  }, [violations]);
+
+  // Pre-load speech voices and AI vision model in background
   useEffect(() => {
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.getVoices();
     }
+    // Warm up proctoring models (MediaPipe FaceMesh + COCO-SSD via CDN)
+    // We mark as loaded immediately so interview isn't blocked;
+    // canvas fallbacks work even before CDN models finish loading.
+    setAiModelLoaded(true);
+    loadProctoringModels().then(() => {
+      console.log("[Proctor] Models ready");
+    }).catch((err) => {
+      console.warn("[Proctor] Model pre-load warning:", err);
+    });
   }, []);
 
-  // Update video element source object
+  // Dedicated video element attachment callback ref to guarantee webcam video plays
+  const attachVideoStream = useCallback((node: HTMLVideoElement | null) => {
+    if (node) {
+      videoRef.current = node;
+      if (stream && node.srcObject !== stream) {
+        node.srcObject = stream;
+        node.play().catch(() => {});
+      }
+    }
+  }, [stream]);
+
+  // Update video element source object whenever stream or screen changes
   useEffect(() => {
     if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+      if (videoRef.current.srcObject !== stream) {
+        videoRef.current.srcObject = stream;
+      }
+      videoRef.current.play().catch(() => {});
     }
   }, [stream, screen]);
 
@@ -111,12 +232,12 @@ export default function InterviewClient() {
   }, [screen]);
 
   // Stop video stream
-  const stopMediaStream = () => {
+  const stopMediaStream = useCallback(() => {
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
       setStream(null);
     }
-  };
+  }, [stream]);
 
   // Fullscreen controls
   const enterFullscreen = async () => {
@@ -129,7 +250,7 @@ export default function InterviewClient() {
       }
       setIsFullscreen(true);
     } catch (err) {
-      console.error("Fullscreen request failed", err);
+      console.warn("Fullscreen request not permitted:", err);
     }
   };
 
@@ -144,11 +265,188 @@ export default function InterviewClient() {
       }
       setIsFullscreen(false);
     } catch (err) {
-      console.error("Failed to exit fullscreen", err);
+      console.warn("Failed to exit fullscreen:", err);
     }
   };
 
-  // Request camera and microphone permissions
+  const formatTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  /* ────────────────────────────────────────────────────────────
+     PROCTORING ENGINE: Anti-Cheating, Phone, Gaze, Tab Monitors
+     ──────────────────────────────────────────────────────────── */
+
+  const triggerViolation = useCallback((type: ProctoringViolation["type"], message: string) => {
+    if (screenRef.current !== "interview") return;
+
+    const now = Date.now();
+    // Cooldown of 4000ms to prevent double-firing on refocus
+    if (now - lastViolationTimeRef.current < 4000) return;
+    lastViolationTimeRef.current = now;
+
+    const currentCount = violationsRef.current.length + 1;
+    const timeStr = formatTime(elapsedRef.current);
+
+    const record: ProctoringViolation = {
+      id: Math.random().toString(36).substring(2, 9),
+      type,
+      timestamp: timeStr,
+      message,
+      severity: currentCount >= 2 ? "fatal" : "warning",
+    };
+
+    const newViolations = [...violationsRef.current, record];
+    violationsRef.current = newViolations;
+    setViolations(newViolations);
+
+    if (currentCount === 1) {
+      // ⚠️ FIRST VIOLATION: Show warning message & play warning chime
+      playWarningBeep();
+      setActiveWarning(record);
+      setWarningModalOpen(true);
+      toast.warning(`⚠️ Warning 1/2: ${message}`, {
+        duration: 7000,
+      });
+    } else {
+      // 🛑 SECOND VIOLATION: Cancel and terminate interview immediately
+      playTerminationBuzzer();
+      setWarningModalOpen(false);
+      setActiveWarning(null);
+      stopMediaStream();
+      stopRecording();
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+      exitFullscreen();
+      setScreen("cancelled");
+      toast.error("Interview Cancelled! Multiple proctoring infractions detected.", {
+        duration: 9000,
+      });
+    }
+  }, [stopMediaStream]);
+
+  // Tab Switch & Window Focus & DevTools & Paste Listeners
+  useEffect(() => {
+    if (screen !== "interview") return;
+
+    const handleVisibilityChange = () => {
+      if (document.hidden && screenRef.current === "interview") {
+        triggerViolation("tab_switch", "Tab switch or minimized browser window detected");
+      }
+    };
+
+    const handleWindowBlur = () => {
+      if (screenRef.current === "interview") {
+        triggerViolation("window_blur", "Left interview tab / switched to another application");
+      }
+    };
+
+    const handlePaste = (e: ClipboardEvent) => {
+      if (screenRef.current === "interview") {
+        triggerViolation("clipboard_paste", "External clipboard paste attempt detected");
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // DevTools or Alt-Tab detection
+      if (e.key === "F12" || (e.ctrlKey && e.shiftKey && (e.key === "I" || e.key === "J" || e.key === "C"))) {
+        e.preventDefault();
+        triggerViolation("window_blur", "Developer tools inspection shortcut attempted");
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("paste", handlePaste);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("paste", handlePaste);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [screen, triggerViolation]);
+
+  // AI Vision & Gaze & Phone Frame Loop
+  useEffect(() => {
+    if (screen !== "interview") {
+      consecutivePhoneRef.current = 0;
+      consecutiveMultiPersonRef.current = 0;
+      consecutiveAwayRef.current = 0;
+      return;
+    }
+
+    if (!canvasRef.current && typeof document !== "undefined") {
+      const c = document.createElement("canvas");
+      c.width = 160;
+      c.height = 120;
+      canvasRef.current = c;
+    }
+
+    const intervalId = setInterval(async () => {
+      if (screenRef.current !== "interview") return;
+      const video = videoRef.current;
+      if (!video || video.readyState < 2 || video.paused || video.ended) {
+        return;
+      }
+
+      const analysis = await analyzeVideoFrame(video, objectModelRef.current, canvasRef.current);
+      setProctorAnalysis(analysis);
+
+      // 1. Check Phone Detection (2 consecutive detections ≈ 1.3s to avoid single-frame noise)
+      if (analysis.phoneDetected) {
+        consecutivePhoneRef.current += 1;
+        if (consecutivePhoneRef.current >= 2) {
+          triggerViolation("phone", `📱 Mobile phone / unauthorized device detected in camera — ${analysis.summary}`);
+          consecutivePhoneRef.current = 0;
+        }
+      } else {
+        consecutivePhoneRef.current = Math.max(0, consecutivePhoneRef.current - 1);
+      }
+
+      // 2. Check Multiple People
+      if (analysis.multiplePersonsDetected) {
+        consecutiveMultiPersonRef.current += 1;
+        if (consecutiveMultiPersonRef.current >= 2) {
+          triggerViolation("multiple_persons", "Multiple people detected in interview room/camera feed");
+          consecutiveMultiPersonRef.current = 0;
+        }
+      } else {
+        consecutiveMultiPersonRef.current = Math.max(0, consecutiveMultiPersonRef.current - 1);
+      }
+
+      // 3. Check Gaze / Looking Outside Screen
+      if (analysis.faceStatus === "away" || analysis.faceStatus === "missing") {
+        consecutiveAwayRef.current += 1;
+        // 3 consecutive ticks (~2s) of looking away triggers strike
+        if (consecutiveAwayRef.current >= 3) {
+          const dir = analysis.lookingDirection;
+          const reason =
+            dir === "down"
+              ? "👇 Looking DOWN — notes, phone on lap, or desk cheat sheet detected"
+              : dir === "left" || dir === "right"
+              ? `👀 Looking ${dir?.toUpperCase()} — eyes outside screen for over 2 seconds`
+              : dir === "up"
+              ? "👆 Looking UP — away from screen for over 2 seconds"
+              : analysis.faceStatus === "missing"
+              ? "🚫 Face left camera frame — candidate not visible for over 2 seconds"
+              : "👀 Looking outside screen for over 2 seconds";
+
+          triggerViolation("looking_away", reason);
+          consecutiveAwayRef.current = 0;
+        }
+      } else {
+        consecutiveAwayRef.current = 0;
+      }
+    }, 650);
+
+    return () => clearInterval(intervalId);
+  }, [screen, triggerViolation]);
+
+  /* ────────────────────────────────────────────────────────────
+     PERMISSIONS & DEVICE SETUP
+     ──────────────────────────────────────────────────────────── */
+
   const requestPermissions = async () => {
     setPermissionsState("requesting");
     try {
@@ -175,7 +473,10 @@ export default function InterviewClient() {
     requestPermissions();
   };
 
-  // Speak AI questions
+  /* ────────────────────────────────────────────────────────────
+     SPEECH & AUDIO
+     ──────────────────────────────────────────────────────────── */
+
   const speakText = (text: string) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       setAiStatus("listening");
@@ -183,14 +484,11 @@ export default function InterviewClient() {
       return;
     }
     
-    // Stop recording while speaking
     stopRecording();
     window.speechSynthesis.cancel();
     setAiStatus("speaking");
 
     const utterance = new SpeechSynthesisUtterance(text);
-    
-    // Choose voice
     const voices = window.speechSynthesis.getVoices();
     const preferredVoice = voices.find(v => 
       v.lang.startsWith("en") && (v.name.includes("Google") || v.name.includes("Natural"))
@@ -215,7 +513,6 @@ export default function InterviewClient() {
     window.speechSynthesis.speak(utterance);
   };
 
-  // Start continuous speech recognition
   const startRecording = () => {
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) return;
@@ -264,17 +561,23 @@ export default function InterviewClient() {
     setIsRecording(false);
   };
 
-  // Initialize and load first question
+  /* ────────────────────────────────────────────────────────────
+     INTERVIEW WORKFLOW
+     ──────────────────────────────────────────────────────────── */
+
   const handleStartInterview = async () => {
     if (permissionsState !== "granted") {
       toast.error("Camera and Microphone permissions are required to start the interview.");
       return;
     }
 
+    setViolations([]);
+    violationsRef.current = [];
+    setWarningModalOpen(false);
+    setActiveWarning(null);
     setAiStatus("thinking");
     setScreen("interview");
     
-    // Request Fullscreen
     await enterFullscreen();
 
     try {
@@ -289,7 +592,6 @@ export default function InterviewClient() {
     }
   };
 
-  // Handle submit answer
   const handleSubmitAnswer = async () => {
     if (!transcript.trim()) {
       toast.error("Please provide an answer first. You can speak or type in the box.");
@@ -328,7 +630,6 @@ export default function InterviewClient() {
     }
   };
 
-  // End Interview early or complete
   const handleFinishInterview = async (finalHistory: InterviewHistoryItem[]) => {
     setScreen("evaluating");
     setAiStatus("thinking");
@@ -345,7 +646,6 @@ export default function InterviewClient() {
       });
       setEvaluation(evalRes);
       
-      // Save Result to DB
       setIsSavingResult(true);
       try {
         await saveResultFn({
@@ -379,9 +679,8 @@ export default function InterviewClient() {
     setHistory([]);
     setTranscript("");
     setShowExitConfirm(false);
+    setViolations([]);
   };
-
-  const formatTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
   return (
     <AppShell>
@@ -399,13 +698,13 @@ export default function InterviewClient() {
             >
               <div className="text-center mb-10">
                 <div className="inline-flex items-center gap-2 rounded-full border border-primary/30 bg-primary/10 px-4 py-1.5 text-xs font-semibold text-primary mb-4 shadow-[0_0_15px_rgba(139,92,246,0.15)]">
-                  <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" /> AI Mock Interview Coach
+                  <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" /> AI Mock Interview Coach & Smart Proctor
                 </div>
                 <h1 className="text-3xl md:text-4xl font-extrabold text-foreground mb-3 tracking-tight">
                   Master Your Next Interview
                 </h1>
                 <p className="text-muted-foreground text-sm max-w-md mx-auto leading-relaxed">
-                  Experience a high-fidelity interactive mock interview. Answer verbally, receive dynamic follow-ups, and get detailed AI feedback.
+                  Experience a high-fidelity interactive mock interview with real-time AI audio, phone detection, gaze monitoring, and rigorous anti-cheat proctoring.
                 </p>
               </div>
 
@@ -434,14 +733,18 @@ export default function InterviewClient() {
                   className="w-full rounded-xl border border-border bg-muted/50 px-4 py-3.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/40 mb-6 transition-all"
                 />
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs text-muted-foreground mb-6">
-                  <div className="flex items-center gap-2.5 bg-muted/30 border border-border/50 rounded-xl p-3.5">
-                    <Volume2 className="h-4 w-4 text-primary" />
-                    <span>Uses native speech synthesis</span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs text-muted-foreground mb-6">
+                  <div className="flex items-center gap-2 bg-muted/30 border border-border/50 rounded-xl p-3">
+                    <Smartphone className="h-4 w-4 text-amber-400 shrink-0" />
+                    <span>Phone Detection</span>
                   </div>
-                  <div className="flex items-center gap-2.5 bg-muted/30 border border-border/50 rounded-xl p-3.5">
-                    <Mic className="h-4 w-4 text-primary" />
-                    <span>Real-time voice-to-text input</span>
+                  <div className="flex items-center gap-2 bg-muted/30 border border-border/50 rounded-xl p-3">
+                    <Eye className="h-4 w-4 text-primary shrink-0" />
+                    <span>Gaze & Look-Away</span>
+                  </div>
+                  <div className="flex items-center gap-2 bg-muted/30 border border-border/50 rounded-xl p-3">
+                    <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span>Tab Monitoring</span>
                   </div>
                 </div>
 
@@ -467,10 +770,10 @@ export default function InterviewClient() {
             >
               <div className="text-center mb-8">
                 <h1 className="text-2xl font-extrabold text-foreground mb-2 flex items-center justify-center gap-2">
-                  <Camera className="h-6 w-6 text-primary" /> Set Up Device & Permissions
+                  <Camera className="h-6 w-6 text-primary" /> Set Up Device & Security
                 </h1>
                 <p className="text-xs text-muted-foreground">
-                  Confirm your camera and microphone are operational before beginning the fullscreen interview.
+                  Confirm your camera and microphone are operational. The AI proctor will scan for unauthorized items, phones, or tab switches.
                 </p>
               </div>
 
@@ -480,7 +783,7 @@ export default function InterviewClient() {
                 <div className="card rounded-2xl border border-border bg-card/45 backdrop-blur-md overflow-hidden aspect-video flex flex-col justify-center items-center relative">
                   {permissionsState === "granted" && stream ? (
                     <video
-                      ref={videoRef}
+                      ref={attachVideoStream}
                       autoPlay
                       playsInline
                       muted
@@ -506,7 +809,7 @@ export default function InterviewClient() {
                 {/* Device Status Checklist */}
                 <div className="card rounded-2xl border border-border bg-card/45 backdrop-blur-md p-6 flex flex-col justify-between">
                   <div className="space-y-4">
-                    <h3 className="text-sm font-bold text-foreground mb-2">Device Checks</h3>
+                    <h3 className="text-sm font-bold text-foreground mb-2">Proctoring System Status</h3>
                     
                     <div className="flex items-center justify-between border-b border-border/50 pb-3">
                       <span className="text-xs text-muted-foreground font-medium">Camera Feed</span>
@@ -529,6 +832,11 @@ export default function InterviewClient() {
                         <span className="text-xs text-muted-foreground font-bold">Waiting...</span>
                       )}
                     </div>
+
+                    <div className="flex items-center justify-between border-b border-border/50 pb-3">
+                      <span className="text-xs text-muted-foreground font-medium">Phone & Cheat Scanner</span>
+                      <span className="flex items-center gap-1 text-xs text-primary font-bold"><ShieldCheck className="h-4 w-4 text-emerald-400" /> Active (2-Strike Rule)</span>
+                    </div>
                   </div>
 
                   {permissionsState === "denied" && (
@@ -544,7 +852,7 @@ export default function InterviewClient() {
                     <div className="flex gap-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 px-3.5 py-3 text-xs text-emerald-400 mt-4 leading-relaxed">
                       <ShieldCheck className="h-4 w-4 shrink-0 mt-0.5" />
                       <div>
-                        <strong>Devices Ready.</strong> Click the start button below to initiate fullscreen mode and begin your mock interview.
+                        <strong>Security Ready.</strong> Keep your face in the camera frame, do not bring phones into view, and do not switch tabs.
                       </div>
                     </div>
                   )}
@@ -597,7 +905,25 @@ export default function InterviewClient() {
                   </span>
                 </div>
 
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
+                  {/* Proctoring Status Pill */}
+                  <div className={`hidden sm:flex items-center gap-1.5 text-xs px-3 py-1 rounded-lg border font-semibold transition-all ${
+                    violations.length === 0
+                      ? proctorAnalysis.phoneDetected
+                        ? "bg-red-500/20 border-red-500/50 text-red-400 animate-pulse"
+                        : "bg-emerald-500/10 border-emerald-500/25 text-emerald-400"
+                      : "bg-amber-500/15 border-amber-500/35 text-amber-400 animate-pulse"
+                  }`}>
+                    <ShieldAlert className="h-3.5 w-3.5" />
+                    <span>
+                      {proctorAnalysis.phoneDetected
+                        ? "⚠️ PHONE IN VIEW"
+                        : violations.length === 0
+                        ? "Proctoring: Active"
+                        : `1 Strike Issued (${violations.length}/2)`}
+                    </span>
+                  </div>
+
                   <div className="flex items-center gap-1.5 text-xs text-muted-foreground font-mono bg-muted/50 border border-border px-3 py-1 rounded-lg">
                     <Clock className="h-3.5 w-3.5 text-primary" /> {formatTime(elapsed)}
                   </div>
@@ -684,7 +1010,7 @@ export default function InterviewClient() {
                       </div>
                     </div>
 
-                    {/* Speech Bar visualizer (Framer Motion) */}
+                    {/* Speech Bar visualizer */}
                     <div className="flex items-center gap-1.5 h-6 mb-2">
                       {[...Array(6)].map((_, i) => (
                         <motion.div
@@ -748,14 +1074,14 @@ export default function InterviewClient() {
 
                 </div>
 
-                {/* COLUMN 2: CANDIDATE VIEW & TRANSCRIPT */}
+                {/* COLUMN 2: CANDIDATE VIEW WITH LIVE FACE HUD & DETECTED BOUNDING BOXES */}
                 <div className="flex flex-col gap-6 flex-1 min-h-0">
                   
-                  {/* Live Webcam Box */}
+                  {/* Live Webcam Box with Phone Scanner & Gaze Reticle */}
                   <div className="card rounded-3xl border border-border bg-card/45 backdrop-blur-lg overflow-hidden aspect-video relative shadow-md group">
                     {stream ? (
                       <video
-                        ref={videoRef}
+                        ref={attachVideoStream}
                         autoPlay
                         playsInline
                         muted
@@ -768,15 +1094,95 @@ export default function InterviewClient() {
                       </div>
                     )}
                     
-                    {/* Bounding box grid details for high-tech aesthetic */}
-                    <div className="absolute inset-4 border border-dashed border-white/5 rounded-2xl pointer-events-none" />
+                    {/* Live Detected AI Bounding Boxes (Phones, Items, Faces) */}
+                    <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                      {proctorAnalysis.detectedObjects.map((obj, i) => {
+                        const videoW = videoRef.current?.videoWidth || 640;
+                        const videoH = videoRef.current?.videoHeight || 480;
+                        // Video is mirrored horizontally (-scale-x-100)
+                        const leftPct = 100 - ((obj.bbox[0] + obj.bbox[2]) / videoW) * 100;
+                        const topPct = (obj.bbox[1] / videoH) * 100;
+                        const widthPct = (obj.bbox[2] / videoW) * 100;
+                        const heightPct = (obj.bbox[3] / videoH) * 100;
+
+                        const isThreat = obj.type === "phone" || obj.type === "multiple_persons" || obj.type === "unauthorized_item";
+
+                        return (
+                          <div
+                            key={i}
+                            className={`absolute border-2 transition-all duration-300 rounded-lg ${
+                              isThreat
+                                ? "border-red-500 bg-red-500/15 shadow-[0_0_15px_rgba(239,68,68,0.5)] animate-pulse"
+                                : "border-primary/60 bg-primary/5 shadow-[0_0_10px_rgba(139,92,246,0.3)]"
+                            }`}
+                            style={{
+                              left: `${Math.max(2, Math.min(90, leftPct))}%`,
+                              top: `${Math.max(2, Math.min(80, topPct))}%`,
+                              width: `${Math.max(8, Math.min(90, widthPct))}%`,
+                              height: `${Math.max(8, Math.min(85, heightPct))}%`,
+                            }}
+                          >
+                            <span className={`absolute -top-5 left-0 text-[8px] font-black uppercase px-1.5 py-0.5 rounded shadow-sm whitespace-nowrap ${
+                              isThreat ? "bg-red-600 text-white" : "bg-primary text-white"
+                            }`}>
+                              {obj.label}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Face Target HUD Reticle (Corner Brackets) */}
+                    <div className="absolute inset-6 border border-dashed border-primary/20 rounded-2xl pointer-events-none flex flex-col justify-between p-2">
+                      <div className="flex justify-between">
+                        <div className="w-4 h-4 border-t-2 border-l-2 border-primary/80 rounded-tl" />
+                        <div className="w-4 h-4 border-t-2 border-r-2 border-primary/80 rounded-tr" />
+                      </div>
+                      <div className="flex justify-between">
+                        <div className="w-4 h-4 border-b-2 border-l-2 border-primary/80 rounded-bl" />
+                        <div className="w-4 h-4 border-b-2 border-r-2 border-primary/80 rounded-br" />
+                      </div>
+                    </div>
                     
-                    <div className="absolute top-3 left-3 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-[9px] font-bold text-white uppercase tracking-wider backdrop-blur-md border border-white/5">
+                    {/* Live Camera Badge */}
+                    <div className="absolute top-3 left-3 flex items-center gap-1.5 rounded-full bg-black/75 px-2.5 py-1 text-[9px] font-bold text-white uppercase tracking-wider backdrop-blur-md border border-white/10 shadow-sm">
                       <span className="h-2 w-2 rounded-full bg-red-500 animate-ping" /> Live Camera
                     </div>
 
-                    <div className="absolute bottom-3 right-3 text-[9px] font-mono font-bold text-white/50 bg-black/60 px-2 py-0.5 rounded backdrop-blur-sm border border-white/5">
-                      FPS: 30 · 480p
+                    {/* Threat & Gaze Status Badge */}
+                    <div className="absolute top-3 right-3 flex items-center gap-1.5 rounded-full bg-black/80 px-2.5 py-1 text-[9px] font-bold uppercase tracking-wider backdrop-blur-md border border-white/10 shadow-sm">
+                      {proctorAnalysis.phoneDetected ? (
+                        <span className="flex items-center gap-1 text-red-400 font-black animate-bounce">
+                          <Smartphone className="h-3 w-3" /> Phone In View!
+                        </span>
+                      ) : proctorAnalysis.multiplePersonsDetected ? (
+                        <span className="flex items-center gap-1 text-red-400 font-black animate-bounce">
+                          <Users className="h-3 w-3" /> Multiple People!
+                        </span>
+                      ) : proctorAnalysis.faceStatus === "detected" ? (
+                        <span className="flex items-center gap-1 text-emerald-400">
+                          <span className="h-2 w-2 rounded-full bg-emerald-400" /> Eyes On Screen
+                        </span>
+                      ) : proctorAnalysis.lookingDirection === "down" ? (
+                        <span className="flex items-center gap-1 text-amber-400 animate-pulse">
+                          <EyeOff className="h-3 w-3" /> Looking Down / Away?
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1 text-amber-400 animate-pulse">
+                          <EyeOff className="h-3 w-3" /> Looking Outside Screen
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Bottom Proctoring Status Bar */}
+                    <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between text-[9px] font-mono font-bold text-white/90 bg-black/80 px-3 py-1.5 rounded-xl backdrop-blur-md border border-white/10">
+                      <span className="flex items-center gap-1.5">
+                        <ShieldAlert className="h-3.5 w-3.5 text-primary" />
+                        AI Vision & Cheat Scanner: Active
+                      </span>
+                      <span className={violations.length > 0 ? "text-amber-400 font-black" : "text-emerald-400 font-bold"}>
+                        Strikes: {violations.length}/2
+                      </span>
                     </div>
                   </div>
 
@@ -850,7 +1256,7 @@ export default function InterviewClient() {
 
               </div>
 
-              {/* PROGRESS BAR BAR */}
+              {/* PROGRESS BAR */}
               <div className="card border border-border/80 bg-card/25 backdrop-blur-md rounded-2xl p-3.5 shadow-sm">
                 <div className="flex items-center justify-between text-[10px] font-bold text-muted-foreground mb-1.5">
                   <span>INTERVIEW COMPLETION PROGRESS</span>
@@ -865,6 +1271,69 @@ export default function InterviewClient() {
                   />
                 </div>
               </div>
+
+              {/* ─── PROCTORING WARNING MODAL (FIRST INFRACTION) ─── */}
+              <AnimatePresence>
+                {warningModalOpen && activeWarning && (
+                  <div className="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-50 backdrop-blur-md">
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.92, y: 20 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.95 }}
+                      className="bg-card text-foreground border-2 border-amber-500/60 p-6 rounded-3xl w-full max-w-md shadow-[0_0_60px_rgba(245,158,11,0.3)] relative overflow-hidden"
+                    >
+                      <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-amber-500 via-orange-500 to-red-500" />
+                      
+                      <div className="flex items-center gap-3 mb-4">
+                        <div className="grid h-12 w-12 place-items-center rounded-2xl bg-amber-500/20 border border-amber-500/40 text-amber-400 shrink-0 animate-bounce">
+                          {activeWarning.type === "phone" ? (
+                            <Smartphone className="h-6 w-6 text-red-400" />
+                          ) : activeWarning.type === "multiple_persons" ? (
+                            <Users className="h-6 w-6 text-red-400" />
+                          ) : (
+                            <ShieldAlert className="h-6 w-6 text-amber-400" />
+                          )}
+                        </div>
+                        <div>
+                          <span className="text-[10px] uppercase font-black tracking-widest text-amber-400 bg-amber-500/15 px-2.5 py-0.5 rounded border border-amber-500/30">
+                            Warning Strike 1 of 2
+                          </span>
+                          <h3 className="text-base font-black text-foreground mt-1">
+                            Anti-Cheat Infraction Detected
+                          </h3>
+                        </div>
+                      </div>
+
+                      <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 mb-4 text-xs text-amber-200 leading-relaxed">
+                        <p className="font-bold text-amber-300 mb-1 flex items-center gap-1.5">
+                          <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
+                          {activeWarning.message}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground mt-1 font-mono">
+                          Logged at Elapsed Time: {activeWarning.timestamp}
+                        </p>
+                      </div>
+
+                      <div className="text-xs text-muted-foreground space-y-2 mb-6">
+                        <p className="font-semibold text-foreground">Required Conduct:</p>
+                        <ul className="space-y-1.5 text-[11px] list-disc list-inside">
+                          <li>Keep your eyes on the screen; do not look down or away.</li>
+                          <li>Ensure no mobile phones or other devices are in camera view.</li>
+                          <li>Do not switch browser tabs or open external windows.</li>
+                          <li className="text-red-400 font-bold">A second infraction will permanently cancel and disqualify this interview.</li>
+                        </ul>
+                      </div>
+
+                      <button
+                        onClick={() => setWarningModalOpen(false)}
+                        className="w-full flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 py-3.5 text-xs font-black text-black uppercase tracking-wider transition-all shadow-lg hover:shadow-amber-500/20 cursor-pointer"
+                      >
+                        I Understand — Resume Interview
+                      </button>
+                    </motion.div>
+                  </div>
+                )}
+              </AnimatePresence>
 
               {/* EXIT CONFIRMATION MODAL */}
               <AnimatePresence>
@@ -906,6 +1375,82 @@ export default function InterviewClient() {
                 )}
               </AnimatePresence>
 
+            </motion.div>
+          )}
+
+          {/* ─── SCREEN: CANCELLED / TERMINATED (PROCTORING DISQUALIFICATION) ─── */}
+          {screen === "cancelled" && (
+            <motion.div
+              key="cancelled"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="max-w-xl mx-auto w-full py-10 px-4"
+            >
+              <div className="card rounded-3xl border-2 border-red-500/40 bg-card/60 backdrop-blur-xl p-8 shadow-[0_0_60px_rgba(239,68,68,0.2)] text-center relative overflow-hidden">
+                <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-red-600 via-rose-500 to-amber-600" />
+                
+                <motion.div
+                  initial={{ scale: 0 }}
+                  animate={{ scale: 1 }}
+                  transition={{ type: "spring", stiffness: 220, damping: 15 }}
+                  className="grid h-20 w-20 place-items-center rounded-3xl bg-red-500/15 border-2 border-red-500/30 text-red-500 mx-auto mb-6 shadow-inner"
+                >
+                  <Ban className="h-10 w-10" />
+                </motion.div>
+
+                <div className="inline-flex items-center gap-1.5 rounded-full bg-red-500/10 border border-red-500/30 px-3 py-1 text-[10px] font-extrabold uppercase tracking-wider text-red-400 mb-3">
+                  <ShieldAlert className="h-3.5 w-3.5" /> Proctoring Disqualification
+                </div>
+
+                <h1 className="text-2xl sm:text-3xl font-black text-foreground mb-3 tracking-tight">
+                  Interview Cancelled
+                </h1>
+                
+                <p className="text-xs text-muted-foreground max-w-md mx-auto leading-relaxed mb-6">
+                  This mock interview session was automatically terminated due to multiple security and anti-cheat infractions.
+                </p>
+
+                {/* Infractions Log */}
+                <div className="bg-muted/40 border border-border/80 rounded-2xl p-4 text-left mb-6 space-y-3">
+                  <h3 className="text-[11px] font-extrabold text-foreground uppercase tracking-wider flex items-center justify-between">
+                    <span>Recorded Violations</span>
+                    <span className="text-red-400">{violations.length} Infractions Logged</span>
+                  </h3>
+
+                  <div className="space-y-2">
+                    {violations.map((v, i) => (
+                      <div
+                        key={v.id || i}
+                        className="flex items-start gap-2.5 bg-background/60 border border-red-500/20 rounded-xl p-3 text-xs"
+                      >
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase shrink-0 mt-0.5 ${
+                          i === 0 ? "bg-amber-500/15 text-amber-400 border border-amber-500/30" : "bg-red-500/15 text-red-400 border border-red-500/30"
+                        }`}>
+                          {i === 0 ? "Strike 1 (Warning)" : "Strike 2 (Terminated)"}
+                        </span>
+                        <div className="flex-1">
+                          <p className="text-foreground font-semibold leading-snug">{v.message}</p>
+                          <span className="text-[10px] text-muted-foreground font-mono">Logged at: {v.timestamp}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Retake Action */}
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <button
+                    onClick={() => {
+                      setViolations([]);
+                      setScreen("setup");
+                    }}
+                    className="flex-1 flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-primary to-violet-600 py-3.5 text-xs font-bold text-white shadow-lg hover:shadow-primary/25 transition-all cursor-pointer"
+                  >
+                    <RotateCcw className="h-4 w-4" /> Start A New Interview
+                  </button>
+                </div>
+              </div>
             </motion.div>
           )}
 
