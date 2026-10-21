@@ -7,7 +7,7 @@ services:
     startCommand: node .output/server/index.mjs
     envVars:
       - key: NODE_VERSION
-        value: 18.0.0
+        value: 20.18.0
       - key: SUPABASE_PROJECT_ID
         sync: false
       - key: SUPABASE_PUBLISHABLE_KEY
